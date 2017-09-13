@@ -68,20 +68,53 @@ const JenkinsIndicator = new Lang.Class({
 		}));
 	},
 
+	_make_get_url: function(path) {
+		let url = Utils.urlAppend(this.settings.jenkins_url, path);
+		let request = Soup.Message.new('GET', url);
+		if( this.settings.use_authentication ) {
+			request.request_headers.append('Authorization', 'Basic ' + Glib.base64_encode(this.settings.auth_user + ':' + this.settings.api_token));
+		}
+		return request
+	},
+
+	request_serialized: function(parent_job) {
+		/* we assume that this._isRequesting is set */
+		let request = this._make_get_url("job/%s/api/json".format(parent_job));
+		if (!request) {
+			this.showError(_("Invalid Jenkins CI Server web frontend URL"));
+			return
+		}
+
+		/* synchronous, see function below */
+		let response = this.httpSession.send_message(request)
+
+		if (response!==200 ) {
+			this.showError(_("Invalid Jenkins URL %s (HTTP Error %s)").format(url, message.status_code));
+			return
+		}
+
+		try {
+			let jenkinsState = JSON.parse(request.response_body.data);
+			let subjobs = jenkinsState.jobs;
+			for( let i=0 ; i< subjobs.length ; ++i ) {
+				let J =  subjobs[i]
+				J["name"] = parent_job + "/" + J["name"]
+				// global.log("[%d] %s: %s".format(this.jobs.length, J["name"], J["color"]))
+				this.jobs.push(J)
+			}
+		}
+		catch (e) {
+			global.log(e)
+			this.showError(_("Invalid Jenkins CI Server web frontend URL"));
+		}
+	},
+
 	// request local jenkins server for current state
 	request: function() {
 		// only update if no update is currently running
 		if( !this._isRequesting ) {
 			this._isRequesting = true;
-			// ajax request to local jenkins server
-			let request = Soup.Message.new('GET', Utils.urlAppend(this.settings.jenkins_url, 'api/json'));
-
-			// append authentication header (if necessary)
-			// jenkins only supports preemptive authentication so we have to provide authentication info on first request
-			if( this.settings.use_authentication ) {
-				request.request_headers.append('Authorization', 'Basic ' + Glib.base64_encode(this.settings.auth_user + ':' + this.settings.api_token));
-			}
-
+			let request = this._make_get_url("api/json");
 			if( request ) {
 				this.httpSession.queue_message(request, Lang.bind(this, function(httpSession, message) {
 					// http error
@@ -93,11 +126,25 @@ const JenkinsIndicator = new Lang.Class({
 						// parse json
 						try {
 							let jenkinsState = JSON.parse(request.response_body.data);
-
-							// update jobs
-							this.jobs = jenkinsState.jobs;
+							let topjobs = jenkinsState.jobs;
+							this.jobs = []
+							for( let i=0 ; i< topjobs.length ; ++i ) {
+								let J = topjobs[i]
+								/* TODO: jenkins also has folder jobs IIUC,
+								 * we'd like to address them as well */
+								if (J["_class"] != "org.jenkinsci.plugins.workflow.multibranch.WorkflowMultiBranchProject") {
+									// global.log("[%d] %s: %s".format(this.jobs.length, J["name"], J["color"]))
+									this.jobs.push(J)
+								} else {
+									// the request below is synchronous.
+									this.request_serialized(J["name"])
+								}
+							}
 
 							// update indicator (icon and popupmenu contents)
+							// All the requests we need must have been completed
+							// at this point, hence the need for synchronous
+							// requests in .request_serialized().
 							this.update();
 						}
 						catch( e ) {
